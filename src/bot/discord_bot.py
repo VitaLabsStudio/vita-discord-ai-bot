@@ -10,6 +10,7 @@ import asyncio
 from typing import Any, Dict, List, Optional
 from src.backend.utils import clean_text, redact_pii
 from src.backend.logger import get_logger
+from discord.ui import View, Button
 
 load_dotenv()
 
@@ -67,7 +68,32 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot or not bot.http_session:
         return
 
-    ingest_payload: Dict[str, Any] = {
+    # If the message is in a thread, fetch the whole thread and send to /ingest_thread
+    if message.thread or isinstance(message.channel, discord.Thread):
+        thread = message.thread or message.channel
+        messages = []
+        async for m in thread.history(limit=None, oldest_first=True):
+            messages.append({
+                "message_id": str(m.id),
+                "channel_id": str(m.channel.id),
+                "user_id": str(m.author.id),
+                "content": m.content,
+                "timestamp": m.created_at.isoformat(),
+                "attachments": [a.url for a in m.attachments],
+                "thread_id": str(thread.id),
+                "roles": get_user_roles(m.author),
+            })
+        payload = {"thread_id": str(thread.id), "parent_message_id": str(thread.parent_id) if hasattr(thread, "parent_id") else None, "messages": messages}
+        try:
+            async with bot.http_session.post(f"{BACKEND_URL}/ingest_thread", json=payload, headers={"X-API-Key": BACKEND_API_KEY}) as resp:
+                if resp.status != 200:
+                    logger.error(f"Thread ingestion failed: {resp.status}, {await resp.text()}")
+        except Exception as e:
+            logger.error(f"Error sending thread to backend: {e}")
+        return
+
+    # Otherwise, single message ingestion as before
+    ingest_payload = {
         "message_id": str(message.id),
         "channel_id": str(message.channel.id),
         "user_id": str(message.author.id),
@@ -125,7 +151,8 @@ class CommandCog(commands.Cog):
                     embed.add_field(name="Confidence", value=f"{confidence:.2%}", inline=True)
                     embed.add_field(name="Citations", value=citation_text, inline=False)
                     
-                    await interaction.followup.send(embed=embed)
+                    view = FeedbackView(question, answer, citations, self.bot)
+                    await interaction.followup.send(embed=embed, view=view)
                 else:
                     error_text = await resp.text()
                     await interaction.followup.send(f"Sorry, there was an error processing your question. ({resp.status}):\n`{error_text}`")
@@ -244,6 +271,64 @@ class CommandCog(commands.Cog):
                 continue
 
         await status_message.edit(content=f"✅ Historical ingestion complete!\n- Processed {total_ingested} messages successfully.\n- Failed to process {total_failed} messages.")
+
+    @app_commands.command(name="summarize", description="Summarize the current thread.")
+    async def summarize(self, interaction: Interaction) -> None:
+        await interaction.response.defer()
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.followup.send("This command can only be used in a thread.", ephemeral=True)
+            return
+        thread = interaction.channel
+        messages = []
+        async for m in thread.history(limit=None, oldest_first=True):
+            messages.append({
+                "message_id": str(m.id),
+                "channel_id": str(m.channel.id),
+                "user_id": str(m.author.id),
+                "content": m.content,
+                "timestamp": m.created_at.isoformat(),
+                "attachments": [a.url for a in m.attachments],
+                "thread_id": str(thread.id),
+                "roles": get_user_roles(m.author),
+            })
+        payload = {"thread_id": str(thread.id), "parent_message_id": str(thread.parent_id) if hasattr(thread, "parent_id") else None, "messages": messages}
+        async with self.bot.http_session.post(f"{BACKEND_URL}/summarize", json=payload, headers={"X-API-Key": BACKEND_API_KEY}) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                summary = data.get("summary", "No summary could be generated.")
+                await interaction.followup.send(f"**Thread Summary:**\n{summary}")
+            else:
+                await interaction.followup.send("Failed to summarize thread.")
+
+class FeedbackView(View):
+    def __init__(self, query, answer, sources, bot):
+        super().__init__(timeout=60)
+        self.query = query
+        self.answer = answer
+        self.sources = sources
+        self.bot = bot
+
+    @discord.ui.button(label="Good Answer", style=discord.ButtonStyle.success, emoji="👍")
+    async def good_answer(self, interaction: discord.Interaction, button: Button):
+        await self.send_feedback(interaction, "good")
+
+    @discord.ui.button(label="Bad Answer", style=discord.ButtonStyle.danger, emoji="👎")
+    async def bad_answer(self, interaction: discord.Interaction, button: Button):
+        await self.send_feedback(interaction, "bad")
+
+    async def send_feedback(self, interaction, feedback_type):
+        payload = {
+            "user_id": str(interaction.user.id),
+            "query": self.query,
+            "answer": self.answer,
+            "sources": self.sources,
+            "feedback": feedback_type
+        }
+        async with self.bot.http_session.post(f"{BACKEND_URL}/feedback", json=payload, headers={"X-API-Key": BACKEND_API_KEY}) as resp:
+            if resp.status == 200:
+                await interaction.response.send_message("Thank you for your feedback!", ephemeral=True)
+            else:
+                await interaction.response.send_message("Failed to log feedback.", ephemeral=True)
 
 if __name__ == "__main__":
     if not DISCORD_BOT_TOKEN:

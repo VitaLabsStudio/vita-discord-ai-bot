@@ -26,6 +26,9 @@ from src.backend.security import get_api_key
 import pinecone
 import openai
 from src.backend.logger import get_logger
+import spacy
+from sentence_transformers import CrossEncoder
+from src.backend import feedback as feedback_module
 
 app = FastAPI(title="VITA Discord AI Knowledge Assistant Backend")
 
@@ -77,9 +80,15 @@ class QueryResponse(BaseModel):
 
 class FeedbackRequest(BaseModel):
     user_id: str
-    message_id: str
-    feedback: str  # 'up', 'down', 'flag', etc.
-    comment: Optional[str] = None
+    query: str
+    answer: str
+    sources: list
+    feedback: str
+
+class ThreadIngestRequest(BaseModel):
+    thread_id: str
+    parent_message_id: Optional[str] = None
+    messages: List[IngestRequest]
 
 async def process_attachments(attachment_urls: List[str]) -> str:
     """Downloads, parses, and extracts text from file attachments. Supports more types and logs failures."""
@@ -167,6 +176,11 @@ async def ingest_message(req: IngestRequest) -> Dict[str, str]:
         if not full_content.strip():
             return {"status": "skipped_empty", "message_id": req.message_id}
 
+        # Extract NER entities and add to metadata
+        nlp = spacy.load("en_core_web_sm")
+        doc = nlp(redacted)
+        entities = [ent.text for ent in doc.ents if ent.label_ in ("PERSON", "ORG", "PRODUCT", "DATE")]
+        
         # Split into chunks for embedding
         text_chunks = split_text_for_embedding(full_content, max_length=4000, overlap=200)
         metadatas = []
@@ -178,7 +192,8 @@ async def ingest_message(req: IngestRequest) -> Dict[str, str]:
                 "channel_id": req.channel_id if req.channel_id is not None else "",
                 "chunk_text": chunk_text,
                 "roles": req.roles or [],
-                "timestamp": req.timestamp
+                "timestamp": req.timestamp,
+                "entities": entities,
             }
             sanitized_meta = sanitize_metadata(meta)
             print(f"[DEBUG] Metadata before upsert: {sanitized_meta}")
@@ -222,6 +237,14 @@ async def embed_chunks_endpoint(request: EmbedRequest) -> Dict[str, str]:
     # TODO: Call embedding logic
     return {"status": "embedding started", "num_chunks": str(len(request.chunks))}
 
+cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+def rerank_chunks(query: str, chunks: list) -> list:
+    pairs = [(query, chunk['chunk_text']) for chunk in chunks]
+    scores = cross_encoder.predict(pairs)
+    reranked = sorted(zip(chunks, scores), key=lambda x: x[1], reverse=True)
+    return [c for c, s in reranked]
+
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge(req: QueryRequest) -> QueryResponse:
     """Query the knowledge base (RAG pipeline)."""
@@ -234,13 +257,13 @@ async def query_knowledge(req: QueryRequest) -> QueryResponse:
     # 2. Query Pinecone for top-k
     pinecone_results = index.query(
         vector=question_emb,
-        top_k=req.top_k * 2,  # fetch more for permission filtering
+        top_k=25,  # fetch more for permission filtering
         include_metadata=True
     )
     # 3. Filter by permissions
     chunks = [m.metadata | {"score": m.score} for m in pinecone_results.matches]
     filtered = filter_by_permissions(chunks, req.roles, req.channel_id)
-    filtered = sorted(filtered, key=lambda x: -x.get("score", 0))[:req.top_k]
+    filtered = sorted(filtered, key=lambda x: -x.get("score", 0))[:25]
     # 4. Guard clause for empty context
     if not filtered:
         return QueryResponse(
@@ -275,13 +298,20 @@ async def query_knowledge(req: QueryRequest) -> QueryResponse:
         for c in filtered
     ]
     confidence = float(filtered[0]["score"]) if filtered else 0.0
+
+    reranked = rerank_chunks(req.question, filtered)
+    top_chunks = reranked[:5]
+
     return QueryResponse(answer=answer, citations=citations, confidence=confidence)
 
-@app.post("/feedback")
-async def feedback(req: FeedbackRequest) -> Dict[str, str]:
-    """Log user feedback on answers."""
-    log_feedback(req.dict())
-    return {"status": "logged"}
+@app.post("/feedback", dependencies=[Depends(get_api_key)])
+async def feedback_endpoint(req: FeedbackRequest) -> Dict[str, str]:
+    try:
+        feedback_module.log_feedback(req.dict())
+        return {"status": "ok"}
+    except Exception as e:
+        logger.exception(f"Feedback logging error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 @app.post("/delete")
 async def delete_message(req: Dict[str, Any]) -> Dict[str, str]:
@@ -345,6 +375,10 @@ async def batch_ingest_messages(req: BatchIngestRequest) -> Dict[str, Any]:
             full_content = redacted + attachment_text
             if not full_content.strip():
                 continue
+            # Extract NER entities and add to metadata
+            nlp = spacy.load("en_core_web_sm")
+            doc = nlp(redacted)
+            entities = [ent.text for ent in doc.ents if ent.label_ in ("PERSON", "ORG", "PRODUCT", "DATE")]
             # Split into chunks for embedding
             text_chunks = split_text_for_embedding(full_content, max_length=4000, overlap=200)
             all_metadatas = []
@@ -356,7 +390,8 @@ async def batch_ingest_messages(req: BatchIngestRequest) -> Dict[str, Any]:
                     "channel_id": msg.channel_id if msg.channel_id is not None else "",
                     "chunk_text": chunk_text,
                     "roles": msg.roles or [],
-                    "timestamp": msg.timestamp
+                    "timestamp": msg.timestamp,
+                    "entities": entities,
                 }
                 sanitized_meta = sanitize_metadata(meta)
                 print(f"[DEBUG] Metadata before upsert: {sanitized_meta}")
@@ -395,4 +430,78 @@ async def batch_ingest_messages(req: BatchIngestRequest) -> Dict[str, Any]:
         "failed": failed_count,
         "already_processed": already_processed_count,
         "failed_messages": failed_messages
-    } 
+    }
+
+@app.post("/ingest_thread", dependencies=[Depends(get_api_key)])
+async def ingest_thread(req: ThreadIngestRequest) -> Dict[str, str]:
+    """Ingest an entire Discord thread as a single document."""
+    lock_path = os.path.join(LOCKS_DIR, f"{req.thread_id}.lock")
+    if os.path.exists(lock_path):
+        return {"status": "already_processing", "thread_id": req.thread_id}
+    try:
+        with open(lock_path, "w") as f:
+            f.write("")
+        # Combine all messages into a single document, preserving author and timestamp
+        doc_lines = []
+        for m in req.messages:
+            author = m.user_id
+            ts = m.timestamp
+            content = m.content
+            doc_lines.append(f"{author} ({ts}): {content}")
+        full_content = "\n".join(doc_lines)
+        # Clean, redact, and chunk as usual
+        cleaned = clean_text(full_content)
+        redacted = redact_pii(cleaned)
+        doc = spacy.load("en_core_web_sm")
+        entities = [ent.text for ent in doc.ents if ent.label_ in ("PERSON", "ORG", "PRODUCT", "DATE")]
+        chunks = split_text_for_embedding(redacted)
+        # Build metadata for each chunk
+        metadatas = []
+        for i, chunk in enumerate(chunks):
+            metadatas.append({
+                "thread_id": req.thread_id,
+                "parent_message_id": req.parent_message_id or "",
+                "is_thread": True,
+                "chunk_index": i,
+                "total_chunks": len(chunks),
+                "entities": entities,
+            })
+        embeddings = await embed_chunks(chunks)
+        await store_embeddings(embeddings, metadatas)
+        return {"status": "ok", "thread_id": req.thread_id, "chunks": len(chunks)}
+    except Exception as e:
+        logger.exception(f"Thread ingestion error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error.")
+    finally:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+
+@app.post("/summarize", dependencies=[Depends(get_api_key)])
+async def summarize_thread(req: ThreadIngestRequest) -> Dict[str, str]:
+    try:
+        doc_lines = []
+        for m in req.messages:
+            author = m.user_id
+            ts = m.timestamp
+            content = m.content
+            doc_lines.append(f"{author} ({ts}): {content}")
+        full_content = "\n".join(doc_lines)
+        # Use LLM to summarize
+        from src.backend.llm_client import get_llm_summary
+        summary = await get_llm_summary(full_content)
+        return {"summary": summary}
+    except Exception as e:
+        logger.exception(f"Summarize error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error.")
+
+@app.get("/health")
+async def health_check():
+    try:
+        # Try to get Pinecone index stats
+        from pinecone import Index
+        idx = Index(PINECONE_INDEX)
+        _ = idx.describe_index_stats()
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=503, detail="Service unavailable.") 

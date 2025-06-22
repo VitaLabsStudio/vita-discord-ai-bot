@@ -4,25 +4,23 @@ import os
 import json
 from typing import Dict, Any, List
 from threading import Lock
+from src.backend.logger import get_logger
 
 FEEDBACK_LOG_PATH = "feedback_log.json"
 DLQ_PATH = "dead_letter_queue.json"
 _feedback_lock = Lock()
 _dlq_lock = Lock()
+FEEDBACK_LOG = "feedback.jsonl"
+logger = get_logger(__name__)
 
 def log_feedback(feedback: Dict[str, Any]) -> None:
     """Log user feedback (thumbs up/down, flags, etc)."""
-    with _feedback_lock:
-        logs = []
-        if os.path.exists(FEEDBACK_LOG_PATH):
-            with open(FEEDBACK_LOG_PATH, "r") as f:
-                try:
-                    logs = json.load(f)
-                except Exception:
-                    logs = []
-        logs.append(feedback)
-        with open(FEEDBACK_LOG_PATH, "w") as f:
-            json.dump(logs, f)
+    try:
+        with open(FEEDBACK_LOG, "a") as f:
+            f.write(json.dumps(feedback) + "\n")
+        logger.info(f"Logged feedback: {feedback}")
+    except Exception as e:
+        logger.error(f"Failed to log feedback: {e}")
 
 def log_to_dlq(item: Dict[str, Any]) -> None:
     """Log failed ingestion/embedding to dead-letter queue."""
