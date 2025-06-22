@@ -4,9 +4,12 @@ import os
 import json
 from typing import Set, Dict, Any, List
 from threading import Lock
+import tempfile
 
 PROCESSED_LOG_PATH = "processed_messages.json"
 _log_lock = Lock()
+LOCKS_DIR = "locks"
+os.makedirs(LOCKS_DIR, exist_ok=True)
 
 def load_processed_ids() -> Set[str]:
     """Load processed message/file IDs from local log."""
@@ -25,15 +28,21 @@ def save_processed_ids(ids: Set[str]) -> None:
             json.dump(list(ids), f)
 
 def is_processed(message_id: str) -> bool:
-    """Check if a message/file ID has already been processed."""
+    """Check if a message/file ID has already been processed, using a lock file to prevent race conditions."""
+    lock_path = os.path.join(LOCKS_DIR, f"{message_id}.lock")
+    if os.path.exists(lock_path):
+        return True
     processed = load_processed_ids()
     return message_id in processed
 
 def mark_processed(message_id: str) -> None:
-    """Mark a message/file ID as processed."""
+    """Mark a message/file ID as processed and remove its lock file."""
     processed = load_processed_ids()
     processed.add(message_id)
     save_processed_ids(processed)
+    lock_path = os.path.join(LOCKS_DIR, f"{message_id}.lock")
+    if os.path.exists(lock_path):
+        os.remove(lock_path)
 
 def batch_ingest_historical(messages: List[Dict[str, Any]]) -> List[str]:
     """Batch ingest historical messages, skipping already processed ones."""

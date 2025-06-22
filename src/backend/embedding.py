@@ -6,6 +6,7 @@ from pinecone import Pinecone, ServerlessSpec
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 import json
+import uuid
 
 load_dotenv()
 
@@ -72,7 +73,7 @@ async def store_embeddings(embeddings: List[List[float]], metadatas: List[Dict[s
                 sanitized_meta[k] = str(v)
         print(f"DEBUG: Upserting vector metadata: {json.dumps(sanitized_meta)}")
         vectors.append({
-            "id": sanitized_meta["message_id"],
+            "id": uuid.uuid4().hex,
             "values": emb,
             "metadata": sanitized_meta
         })

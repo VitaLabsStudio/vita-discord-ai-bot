@@ -11,7 +11,7 @@ from src.backend.permissions import filter_by_permissions
 from src.backend.feedback import log_feedback, log_to_dlq
 from dotenv import load_dotenv
 from src.backend.utils import clean_text, redact_pii, chunk_messages, split_text_for_embedding
-from src.backend.ingestion import is_processed, mark_processed
+from src.backend.ingestion import is_processed, mark_processed, LOCKS_DIR
 import aiohttp
 from unstructured.partition.auto import partition
 import io
@@ -21,6 +21,7 @@ from PIL import Image
 import tempfile
 import mimetypes
 import json
+import shutil
 
 app = FastAPI(title="VITA Discord AI Knowledge Assistant Backend")
 
@@ -32,6 +33,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Dependency check for tesseract and pdftotext
+missing_deps = []
+if shutil.which('tesseract') is None:
+    missing_deps.append('tesseract')
+if shutil.which('pdftotext') is None:
+    missing_deps.append('pdftotext (poppler-utils)')
+if missing_deps:
+    print(f"[WARNING] Missing system dependencies: {', '.join(missing_deps)}. Some document or image ingestion may fail. Please install them and restart the backend.")
 
 class IngestRequest(BaseModel):
     message_id: str
@@ -127,54 +137,63 @@ async def process_attachments(attachment_urls: List[str]) -> str:
 @app.post("/ingest")
 async def ingest_message(req: IngestRequest) -> Dict[str, str]:
     """Ingest a new Discord message or file."""
-    if is_processed(req.message_id):
-        return {"status": "already_processed", "message_id": req.message_id}
-    
-    # Process attachments
-    attachment_text = ""
-    if req.attachments:
-        attachment_text = await process_attachments(req.attachments)
-
-    # Clean and redact message content
-    cleaned = clean_text(req.content)
-    redacted = redact_pii(cleaned)
-    
-    # Combine message content with attachment text
-    full_content = redacted + attachment_text
-    
-    if not full_content.strip():
-        return {"status": "skipped_empty", "message_id": req.message_id}
-
-    # Split into chunks for embedding
-    text_chunks = split_text_for_embedding(full_content, max_length=4000, overlap=200)
-    metadatas = []
-    for chunk_text in text_chunks:
-        meta = {
-            "message_id": req.message_id,
-            "thread_id": req.thread_id if req.thread_id is not None else "",
-            "user_id": req.user_id if req.user_id is not None else "",
-            "channel_id": req.channel_id if req.channel_id is not None else "",
-            "chunk_text": chunk_text,
-            "roles": req.roles or [],
-            "timestamp": req.timestamp
-        }
-        sanitized_meta = sanitize_metadata(meta)
-        print(f"[DEBUG] Metadata before upsert: {sanitized_meta}")
-        metadatas.append(sanitized_meta)
+    lock_path = os.path.join(LOCKS_DIR, f"{req.message_id}.lock")
+    if os.path.exists(lock_path):
+        return {"status": "already_processing", "message_id": req.message_id}
     try:
-        embeddings = await embed_chunks(text_chunks)
-        await store_embeddings(embeddings, metadatas)
-        mark_processed(req.message_id)
-        return {"status": "ingested", "message_id": req.message_id}
-    except Exception as e:
-        log_to_dlq({
-            "message_id": req.message_id,
-            "error": str(e),
-            "content_preview": full_content[:200],
-            "type": "embedding_or_storage",
-            "metadata": metadatas
-        })
-        return {"status": "error", "message_id": req.message_id, "error": str(e)}
+        with open(lock_path, "w") as f:
+            f.write("")
+        if is_processed(req.message_id):
+            return {"status": "already_processed", "message_id": req.message_id}
+        
+        # Process attachments
+        attachment_text = ""
+        if req.attachments:
+            attachment_text = await process_attachments(req.attachments)
+
+        # Clean and redact message content
+        cleaned = clean_text(req.content)
+        redacted = redact_pii(cleaned)
+        
+        # Combine message content with attachment text
+        full_content = redacted + attachment_text
+        
+        if not full_content.strip():
+            return {"status": "skipped_empty", "message_id": req.message_id}
+
+        # Split into chunks for embedding
+        text_chunks = split_text_for_embedding(full_content, max_length=4000, overlap=200)
+        metadatas = []
+        for chunk_text in text_chunks:
+            meta = {
+                "message_id": req.message_id,
+                "thread_id": req.thread_id if req.thread_id is not None else "",
+                "user_id": req.user_id if req.user_id is not None else "",
+                "channel_id": req.channel_id if req.channel_id is not None else "",
+                "chunk_text": chunk_text,
+                "roles": req.roles or [],
+                "timestamp": req.timestamp
+            }
+            sanitized_meta = sanitize_metadata(meta)
+            print(f"[DEBUG] Metadata before upsert: {sanitized_meta}")
+            metadatas.append(sanitized_meta)
+        try:
+            embeddings = await embed_chunks(text_chunks)
+            await store_embeddings(embeddings, metadatas)
+            mark_processed(req.message_id)
+            return {"status": "ingested", "message_id": req.message_id}
+        except Exception as e:
+            log_to_dlq({
+                "message_id": req.message_id,
+                "error": str(e),
+                "content_preview": full_content[:200],
+                "type": "embedding_or_storage",
+                "metadata": metadatas
+            })
+            return {"status": "error", "message_id": req.message_id, "error": str(e)}
+    finally:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
 
 @app.post("/embed")
 async def embed_chunks_endpoint(request: EmbedRequest) -> Dict[str, str]:
@@ -286,10 +305,16 @@ async def batch_ingest_messages(req: BatchIngestRequest) -> Dict[str, Any]:
     already_processed_count = 0
 
     for msg in req.messages:
-        if is_processed(msg.message_id):
+        lock_path = os.path.join(LOCKS_DIR, f"{msg.message_id}.lock")
+        if os.path.exists(lock_path):
             already_processed_count += 1
             continue
         try:
+            with open(lock_path, "w") as f:
+                f.write("")
+            if is_processed(msg.message_id):
+                already_processed_count += 1
+                continue
             # Process attachments for each message
             attachment_text = ""
             if msg.attachments:
@@ -339,6 +364,9 @@ async def batch_ingest_messages(req: BatchIngestRequest) -> Dict[str, Any]:
                 "type": "ingest_exception"
             })
             failed_messages.append({"message_id": msg.message_id, "error": str(e)})
+        finally:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
 
     return {
         "status": "completed",
