@@ -5,11 +5,17 @@ import json
 from typing import Set, Dict, Any, List
 from threading import Lock
 import tempfile
+import logging
 
 PROCESSED_LOG_PATH = "processed_messages.json"
 _log_lock = Lock()
 LOCKS_DIR = "locks"
 os.makedirs(LOCKS_DIR, exist_ok=True)
+
+DLQ_PATH = "dlq.json"
+_dlq_lock = Lock()
+
+logger = logging.getLogger(__name__)
 
 def load_processed_ids() -> Set[str]:
     """Load processed message/file IDs from local log."""
@@ -56,3 +62,12 @@ def batch_ingest_historical(messages: List[Dict[str, Any]]) -> List[str]:
             new_ids.append(msg_id)
     save_processed_ids(processed_ids)
     return new_ids 
+
+def log_to_dlq(item: dict) -> None:
+    try:
+        with _dlq_lock:
+            with open(DLQ_PATH, "a") as f:
+                f.write(json.dumps(item) + "\n")
+        logger.info(f"DLQ entry: {item}")
+    except Exception as e:
+        logger.error(f"Failed to log to DLQ: {e}") 

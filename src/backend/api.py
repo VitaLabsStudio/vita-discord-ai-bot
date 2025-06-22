@@ -1,6 +1,6 @@
 # FastAPI backend logic will be implemented here 
 
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -29,6 +29,9 @@ from src.backend.logger import get_logger
 import spacy
 from sentence_transformers import CrossEncoder
 from src.backend import feedback as feedback_module
+from fastapi.responses import JSONResponse
+import datetime
+from src.backend.file_processor import process_attachments
 
 app = FastAPI(title="VITA Discord AI Knowledge Assistant Backend")
 
@@ -149,17 +152,15 @@ async def process_attachments(attachment_urls: List[str]) -> str:
             print(f"Failed to process attachment {url}: {e}")
     return "".join(all_docs_text)
 
-@app.post("/ingest", dependencies=[Depends(get_api_key)])
-async def ingest_message(req: IngestRequest) -> Dict[str, str]:
-    """Ingest a new Discord message or file."""
-    lock_path = os.path.join(LOCKS_DIR, f"{req.message_id}.lock")
-    if os.path.exists(lock_path):
-        return {"status": "already_processing", "message_id": req.message_id}
+async def run_ingestion_task(req: IngestRequest):
     try:
+        lock_path = os.path.join(LOCKS_DIR, f"{req.message_id}.lock")
+        if os.path.exists(lock_path):
+            return
         with open(lock_path, "w") as f:
             f.write("")
         if is_processed(req.message_id):
-            return {"status": "already_processed", "message_id": req.message_id}
+            return
         
         # Process attachments
         attachment_text = ""
@@ -174,7 +175,7 @@ async def ingest_message(req: IngestRequest) -> Dict[str, str]:
         full_content = redacted + attachment_text
         
         if not full_content.strip():
-            return {"status": "skipped_empty", "message_id": req.message_id}
+            return
 
         # Extract NER entities and add to metadata
         nlp = spacy.load("en_core_web_sm")
@@ -202,7 +203,7 @@ async def ingest_message(req: IngestRequest) -> Dict[str, str]:
             embeddings = await embed_chunks(text_chunks)
             await store_embeddings(embeddings, metadatas)
             mark_processed(req.message_id)
-            return {"status": "ingested", "message_id": req.message_id}
+            return
         except Exception as e:
             log_to_dlq({
                 "message_id": req.message_id,
@@ -211,25 +212,21 @@ async def ingest_message(req: IngestRequest) -> Dict[str, str]:
                 "type": "embedding_or_storage",
                 "metadata": metadatas
             })
-            return {"status": "error", "message_id": req.message_id, "error": str(e)}
-    except ValidationError as ve:
-        logger.error(f"Validation error: {ve}")
-        raise HTTPException(status_code=422, detail=str(ve))
-    except pinecone.core.client.exceptions.ApiException as pe:
-        logger.error(f"Pinecone error: {pe}")
-        raise HTTPException(status_code=503, detail="Vector database is currently unavailable.")
-    except openai.APIError as oe:
-        logger.error(f"OpenAI error: {oe}")
-        raise HTTPException(status_code=503, detail="AI service provider is currently unavailable.")
-    except aiohttp.ClientError as ce:
-        logger.error(f"Attachment download error: {ce}")
-        raise HTTPException(status_code=400, detail="Failed to download attachment from URL.")
     except Exception as e:
-        logger.exception(f"Unhandled error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error.")
+        log_to_dlq({
+            "original_request": req.dict(),
+            "error_message": str(e),
+            "failed_at_step": "ingestion",
+            "timestamp": datetime.datetime.utcnow().isoformat()
+        })
     finally:
         if os.path.exists(lock_path):
             os.remove(lock_path)
+
+@app.post("/ingest", dependencies=[Depends(get_api_key)])
+async def ingest_message(req: IngestRequest, background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_ingestion_task, req)
+    return JSONResponse(status_code=202, content={"message": "Ingestion task has been accepted and is being processed in the background."})
 
 @app.post("/embed")
 async def embed_chunks_endpoint(request: EmbedRequest) -> Dict[str, str]:
@@ -432,13 +429,11 @@ async def batch_ingest_messages(req: BatchIngestRequest) -> Dict[str, Any]:
         "failed_messages": failed_messages
     }
 
-@app.post("/ingest_thread", dependencies=[Depends(get_api_key)])
-async def ingest_thread(req: ThreadIngestRequest) -> Dict[str, str]:
-    """Ingest an entire Discord thread as a single document."""
-    lock_path = os.path.join(LOCKS_DIR, f"{req.thread_id}.lock")
-    if os.path.exists(lock_path):
-        return {"status": "already_processing", "thread_id": req.thread_id}
+async def run_thread_ingestion_task(req: ThreadIngestRequest):
     try:
+        lock_path = os.path.join(LOCKS_DIR, f"{req.thread_id}.lock")
+        if os.path.exists(lock_path):
+            return
         with open(lock_path, "w") as f:
             f.write("")
         # Combine all messages into a single document, preserving author and timestamp
@@ -468,13 +463,22 @@ async def ingest_thread(req: ThreadIngestRequest) -> Dict[str, str]:
             })
         embeddings = await embed_chunks(chunks)
         await store_embeddings(embeddings, metadatas)
-        return {"status": "ok", "thread_id": req.thread_id, "chunks": len(chunks)}
+        return
     except Exception as e:
-        logger.exception(f"Thread ingestion error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error.")
+        log_to_dlq({
+            "original_request": req.dict(),
+            "error_message": str(e),
+            "failed_at_step": "thread_ingestion",
+            "timestamp": datetime.datetime.utcnow().isoformat()
+        })
     finally:
         if os.path.exists(lock_path):
             os.remove(lock_path)
+
+@app.post("/ingest_thread", dependencies=[Depends(get_api_key)])
+async def ingest_thread(req: ThreadIngestRequest, background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_thread_ingestion_task, req)
+    return JSONResponse(status_code=202, content={"message": "Thread ingestion task has been accepted and is being processed in the background."})
 
 @app.post("/summarize", dependencies=[Depends(get_api_key)])
 async def summarize_thread(req: ThreadIngestRequest) -> Dict[str, str]:
