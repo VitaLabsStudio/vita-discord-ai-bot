@@ -7,20 +7,24 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 import json
 import uuid
+from src.backend.logger import get_logger
 
 load_dotenv()
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-PINECONE_INDEX = os.getenv("PINECONE_INDEX_NAME", "discord-knowledge")
+PINECONE_INDEX = os.getenv("PINECONE_INDEX_NAME", "vita-knowledge-base")
 PINECONE_CLOUD = os.getenv("PINECONE_CLOUD", "aws")
 PINECONE_REGION = os.getenv("PINECONE_REGION", "us-east-1")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
 # Ensure we have the required API keys
 if not PINECONE_API_KEY:
     raise ValueError("PINECONE_API_KEY environment variable is required")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable is required")
+
+logger = get_logger(__name__)
 
 print(f"DEBUG: Using Pinecone index: {PINECONE_INDEX}")
 print(f"DEBUG: Pinecone cloud: {PINECONE_CLOUD}")
@@ -37,11 +41,11 @@ async def embed_chunks(chunks: List[str]) -> List[List[float]]:
     try:
         response = await openai_client.embeddings.create(
             input=chunks,
-            model="text-embedding-ada-002"
+            model=OPENAI_EMBEDDING_MODEL
         )
         return [d.embedding for d in response.data]
     except Exception as e:
-        print(f"DEBUG: Embedding error: {e}")
+        logger.error(f"Embedding error: {e}")
         raise e
 
 def sanitize_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -71,7 +75,7 @@ async def store_embeddings(embeddings: List[List[float]], metadatas: List[Dict[s
                 sanitized_meta[k] = [str(x) if x is not None else "" for x in v]
             elif not isinstance(v, (str, int, float, bool)):
                 sanitized_meta[k] = str(v)
-        print(f"DEBUG: Upserting vector metadata: {json.dumps(sanitized_meta)}")
+        logger.info(f"Upserting vector metadata: {json.dumps(sanitized_meta)}")
         vectors.append({
             "id": uuid.uuid4().hex,
             "values": emb,

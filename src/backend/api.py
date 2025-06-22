@@ -1,6 +1,6 @@
 # FastAPI backend logic will be implemented here 
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -22,6 +22,10 @@ import tempfile
 import mimetypes
 import json
 import shutil
+from src.backend.security import get_api_key
+import pinecone
+import openai
+from src.backend.logger import get_logger
 
 app = FastAPI(title="VITA Discord AI Knowledge Assistant Backend")
 
@@ -42,6 +46,8 @@ if shutil.which('pdftotext') is None:
     missing_deps.append('pdftotext (poppler-utils)')
 if missing_deps:
     print(f"[WARNING] Missing system dependencies: {', '.join(missing_deps)}. Some document or image ingestion may fail. Please install them and restart the backend.")
+
+logger = get_logger(__name__)
 
 class IngestRequest(BaseModel):
     message_id: str
@@ -134,7 +140,7 @@ async def process_attachments(attachment_urls: List[str]) -> str:
             print(f"Failed to process attachment {url}: {e}")
     return "".join(all_docs_text)
 
-@app.post("/ingest")
+@app.post("/ingest", dependencies=[Depends(get_api_key)])
 async def ingest_message(req: IngestRequest) -> Dict[str, str]:
     """Ingest a new Discord message or file."""
     lock_path = os.path.join(LOCKS_DIR, f"{req.message_id}.lock")
@@ -191,6 +197,21 @@ async def ingest_message(req: IngestRequest) -> Dict[str, str]:
                 "metadata": metadatas
             })
             return {"status": "error", "message_id": req.message_id, "error": str(e)}
+    except ValidationError as ve:
+        logger.error(f"Validation error: {ve}")
+        raise HTTPException(status_code=422, detail=str(ve))
+    except pinecone.core.client.exceptions.ApiException as pe:
+        logger.error(f"Pinecone error: {pe}")
+        raise HTTPException(status_code=503, detail="Vector database is currently unavailable.")
+    except openai.APIError as oe:
+        logger.error(f"OpenAI error: {oe}")
+        raise HTTPException(status_code=503, detail="AI service provider is currently unavailable.")
+    except aiohttp.ClientError as ce:
+        logger.error(f"Attachment download error: {ce}")
+        raise HTTPException(status_code=400, detail="Failed to download attachment from URL.")
+    except Exception as e:
+        logger.exception(f"Unhandled error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error.")
     finally:
         if os.path.exists(lock_path):
             os.remove(lock_path)

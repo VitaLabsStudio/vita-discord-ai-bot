@@ -9,11 +9,14 @@ import aiohttp
 import asyncio
 from typing import Any, Dict, List, Optional
 from src.backend.utils import clean_text, redact_pii
+from src.backend.logger import get_logger
 
 load_dotenv()
 
 DISCORD_BOT_TOKEN: str = os.getenv("DISCORD_BOT_TOKEN", "")
-BACKEND_URL: str = os.getenv("BACKEND_URL", "http://localhost:8001")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "your_secret_api_key_here")
+logger = get_logger(__name__)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -75,11 +78,11 @@ async def on_message(message: discord.Message) -> None:
         "roles": get_user_roles(message.author),
     }
     try:
-        async with bot.http_session.post(f"{BACKEND_URL}/ingest", json=ingest_payload) as resp:
+        async with bot.http_session.post(f"{BACKEND_URL}/ingest", json=ingest_payload, headers={"X-API-Key": BACKEND_API_KEY}) as resp:
             if resp.status != 200:
-                print(f"Ingestion failed: {resp.status}, {await resp.text()}")
+                logger.error(f"Ingestion failed: {resp.status}, {await resp.text()}")
     except Exception as e:
-        print(f"Error sending to backend: {e}")
+        logger.error(f"Error sending to backend: {e}")
 
 class CommandCog(commands.Cog):
     def __init__(self, bot: MyBot):
@@ -104,7 +107,7 @@ class CommandCog(commands.Cog):
         
         assert self.bot.http_session is not None
         try:
-            async with self.bot.http_session.post(f"{BACKEND_URL}/query", json=payload) as resp:
+            async with self.bot.http_session.post(f"{BACKEND_URL}/query", json=payload, headers={"X-API-Key": BACKEND_API_KEY}) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     answer = data.get("answer", "No answer could be generated.")
@@ -134,7 +137,7 @@ class CommandCog(commands.Cog):
         """Allows a user to delete their own message from the knowledge base."""
         await interaction.response.defer()
         payload = {"user_id": str(interaction.user.id), "message_id": message_id}
-        async with self.bot.http_session.post(f"{BACKEND_URL}/delete", json=payload) as resp:
+        async with self.bot.http_session.post(f"{BACKEND_URL}/delete", json=payload, headers={"X-API-Key": BACKEND_API_KEY}) as resp:
             if resp.status == 200:
                 await interaction.followup.send("Message deleted from knowledge base.")
             else:
@@ -145,7 +148,7 @@ class CommandCog(commands.Cog):
         """Allows a user to redact their own message in the knowledge base."""
         await interaction.response.defer()
         payload = {"user_id": str(interaction.user.id), "message_id": message_id}
-        async with self.bot.http_session.post(f"{BACKEND_URL}/redact", json=payload) as resp:
+        async with self.bot.http_session.post(f"{BACKEND_URL}/redact", json=payload, headers={"X-API-Key": BACKEND_API_KEY}) as resp:
             if resp.status == 200:
                 await interaction.followup.send("Message redacted in knowledge base.")
             else:
@@ -161,7 +164,7 @@ class CommandCog(commands.Cog):
             "feedback": feedback,
             "comment": comment
         }
-        async with self.bot.http_session.post(f"{BACKEND_URL}/feedback", json=payload) as resp:
+        async with self.bot.http_session.post(f"{BACKEND_URL}/feedback", json=payload, headers={"X-API-Key": BACKEND_API_KEY}) as resp:
             if resp.status == 200:
                 await interaction.followup.send("Feedback logged. Thank you!")
             else:
@@ -171,14 +174,15 @@ class CommandCog(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def ingest_history(self, interaction: Interaction) -> None:
         """Fetches and ingests all historical messages from all channels with robust feedback."""
-        await interaction.response.send_message("✅ Starting historical ingestion. This may take a while...", ephemeral=True)
+        await interaction.response.defer()
+        await interaction.followup.send("✅ Starting historical ingestion. This may take a while...", ephemeral=True)
         
         guild = interaction.guild
         if not guild or not self.bot.http_session:
             await interaction.edit_original_response(content="❌ This command can only be used in a server or the bot is not ready.")
             return
         
-        print("Starting historical ingestion process...")
+        logger.info("Starting historical ingestion process...")
         
         total_ingested = 0
         total_failed = 0
@@ -192,7 +196,7 @@ class CommandCog(commands.Cog):
         status_message = await interaction.followup.send(f"Found {len(text_channels)} channels to process. Starting...", ephemeral=True)
 
         for i, channel in enumerate(text_channels):
-            print(f"[{i+1}/{len(text_channels)}] Fetching history for #{channel.name}...")
+            logger.info(f"[{i+1}/{len(text_channels)}] Fetching history for #{channel.name}...")
             await status_message.edit(content=f"⚙️ Processing channel #{channel.name} ({i+1}/{len(text_channels)})...\nTotal ingested so far: {total_ingested}")
             
             try:
@@ -213,30 +217,30 @@ class CommandCog(commands.Cog):
                     })
 
                     if len(message_batch) >= 50:
-                        async with self.bot.http_session.post(f"{BACKEND_URL}/batch_ingest", json={"messages": message_batch}) as resp:
+                        async with self.bot.http_session.post(f"{BACKEND_URL}/batch_ingest", json={"messages": message_batch}, headers={"X-API-Key": BACKEND_API_KEY}) as resp:
                             if resp.status == 200:
                                 result = await resp.json()
                                 total_ingested += result.get("processed", 0)
                                 total_failed += result.get("failed", 0)
                             else:
                                 total_failed += len(message_batch)
-                                print(f"Batch failed for #{channel.name} with status {resp.status}")
+                                logger.error(f"Batch failed for #{channel.name} with status {resp.status}")
                         message_batch = []
                 
                 if message_batch:
-                    async with self.bot.http_session.post(f"{BACKEND_URL}/batch_ingest", json={"messages": message_batch}) as resp:
+                    async with self.bot.http_session.post(f"{BACKEND_URL}/batch_ingest", json={"messages": message_batch}, headers={"X-API-Key": BACKEND_API_KEY}) as resp:
                         if resp.status == 200:
                             result = await resp.json()
                             total_ingested += result.get("processed", 0)
                             total_failed += result.get("failed", 0)
                         else:
                             total_failed += len(message_batch)
-                            print(f"Final batch failed for #{channel.name} with status {resp.status}")
+                            logger.error(f"Final batch failed for #{channel.name} with status {resp.status}")
             except discord.Forbidden:
-                print(f"Permissions error in #{channel.name}. Skipping.")
+                logger.info(f"Permissions error in #{channel.name}. Skipping.")
                 continue
             except Exception as e:
-                print(f"Unexpected error in #{channel.name}: {e}")
+                logger.error(f"Unexpected error in #{channel.name}: {e}")
                 continue
 
         await status_message.edit(content=f"✅ Historical ingestion complete!\n- Processed {total_ingested} messages successfully.\n- Failed to process {total_failed} messages.")

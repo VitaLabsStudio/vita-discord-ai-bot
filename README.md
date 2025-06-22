@@ -2,28 +2,32 @@
 
 ## Setup
 
-1. **Python 3.10+ required**
-2. Create and activate a virtual environment:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-3. Install dependencies:
-   ```bash
+1. **Clone the repository**
+2. **Create and activate a virtual environment**
+3. **Install dependencies**
+   ```sh
    pip install -r requirements.txt
    ```
-4. Copy `.env` and fill in your API keys.
+4. **Copy `.env.example` to `.env` and fill in all required values**
+5. **Run the application**
+   ```sh
+   python src/main.py
+   ```
 
-## Running
+## Features
+- Discord bot and FastAPI backend run together from a single command
+- All configuration is centralized in `.env`
+- API is secured with an API key (set `BACKEND_API_KEY` in `.env`)
+- Structured logging with configurable log level
+- Robust error handling and user-friendly Discord bot responses
 
-- Start the FastAPI backend:
-  ```bash
-  uvicorn src.backend.api:app --reload
-  ```
-- Start the Discord bot:
-  ```bash
-  python src/bot/discord_bot.py
-  ```
+## Security
+- The backend requires an `X-API-Key` header for all requests
+- The Discord bot is configured to use this key for all backend calls
+
+## Logging
+- Log level is set via `LOG_LEVEL` in `.env`
+- Logs are structured and include timestamps, levels, and module names
 
 ## Environment Variables (.env)
 - DISCORD_TOKEN
