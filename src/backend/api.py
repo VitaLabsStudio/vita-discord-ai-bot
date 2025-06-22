@@ -225,8 +225,10 @@ async def run_ingestion_task(req: IngestRequest):
 
 @app.post("/ingest", dependencies=[Depends(get_api_key)])
 async def ingest_message(req: IngestRequest, background_tasks: BackgroundTasks):
+    if is_processed(req.message_id):
+        return {"status": "already_processed", "message_id": req.message_id}
     background_tasks.add_task(run_ingestion_task, req)
-    return JSONResponse(status_code=202, content={"message": "Ingestion task has been accepted and is being processed in the background."})
+    return {"status": "accepted", "detail": "Ingestion task has been queued."}
 
 @app.post("/embed")
 async def embed_chunks_endpoint(request: EmbedRequest) -> Dict[str, str]:
@@ -344,90 +346,15 @@ async def redact_message(req: Dict[str, Any]) -> Dict[str, str]:
 class BatchIngestRequest(BaseModel):
     messages: List[IngestRequest]
 
-@app.post("/batch_ingest")
-async def batch_ingest_messages(req: BatchIngestRequest) -> Dict[str, Any]:
-    """Ingests a batch of historical messages."""
-    processed_count = 0
-    failed_count = 0
-    failed_messages = []
-    already_processed_count = 0
-
+async def run_batch_ingestion_task(req: BatchIngestRequest):
+    # Move all batch ingestion logic here (process each message, call run_ingestion_task for each)
     for msg in req.messages:
-        lock_path = os.path.join(LOCKS_DIR, f"{msg.message_id}.lock")
-        if os.path.exists(lock_path):
-            already_processed_count += 1
-            continue
-        try:
-            with open(lock_path, "w") as f:
-                f.write("")
-            if is_processed(msg.message_id):
-                already_processed_count += 1
-                continue
-            # Process attachments for each message
-            attachment_text = ""
-            if msg.attachments:
-                attachment_text = await process_attachments(msg.attachments)
-            cleaned = clean_text(msg.content)
-            redacted = redact_pii(cleaned)
-            full_content = redacted + attachment_text
-            if not full_content.strip():
-                continue
-            # Extract NER entities and add to metadata
-            nlp = spacy.load("en_core_web_sm")
-            doc = nlp(redacted)
-            entities = [ent.text for ent in doc.ents if ent.label_ in ("PERSON", "ORG", "PRODUCT", "DATE")]
-            # Split into chunks for embedding
-            text_chunks = split_text_for_embedding(full_content, max_length=4000, overlap=200)
-            all_metadatas = []
-            for chunk_text in text_chunks:
-                meta = {
-                    "message_id": msg.message_id,
-                    "thread_id": msg.thread_id if msg.thread_id is not None else "",
-                    "user_id": msg.user_id if msg.user_id is not None else "",
-                    "channel_id": msg.channel_id if msg.channel_id is not None else "",
-                    "chunk_text": chunk_text,
-                    "roles": msg.roles or [],
-                    "timestamp": msg.timestamp,
-                    "entities": entities,
-                }
-                sanitized_meta = sanitize_metadata(meta)
-                print(f"[DEBUG] Metadata before upsert: {sanitized_meta}")
-                all_metadatas.append(sanitized_meta)
-            try:
-                embeddings = await embed_chunks(text_chunks)
-                await store_embeddings(embeddings, all_metadatas)
-                mark_processed(msg.message_id)
-                processed_count += 1
-            except Exception as embed_error:
-                failed_count += 1
-                log_to_dlq({
-                    "message_id": msg.message_id,
-                    "error": str(embed_error),
-                    "content_preview": full_content[:200],
-                    "type": "embedding_or_storage",
-                    "metadata": all_metadatas
-                })
-                failed_messages.append({"message_id": msg.message_id, "error": str(embed_error)})
-        except Exception as e:
-            failed_count += 1
-            log_to_dlq({
-                "message_id": msg.message_id,
-                "error": str(e),
-                "content_preview": msg.content[:200],
-                "type": "ingest_exception"
-            })
-            failed_messages.append({"message_id": msg.message_id, "error": str(e)})
-        finally:
-            if os.path.exists(lock_path):
-                os.remove(lock_path)
+        await run_ingestion_task(msg)
 
-    return {
-        "status": "completed",
-        "processed": processed_count,
-        "failed": failed_count,
-        "already_processed": already_processed_count,
-        "failed_messages": failed_messages
-    }
+@app.post("/batch_ingest", dependencies=[Depends(get_api_key)])
+async def batch_ingest_messages(req: BatchIngestRequest, background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_batch_ingestion_task, req)
+    return {"status": "accepted", "detail": "Batch ingestion task has been queued."}
 
 async def run_thread_ingestion_task(req: ThreadIngestRequest):
     try:

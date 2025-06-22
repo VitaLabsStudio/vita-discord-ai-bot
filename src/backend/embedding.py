@@ -67,17 +67,8 @@ async def store_embeddings(embeddings: List[List[float]], metadatas: List[Dict[s
     vectors = []
     for emb, meta in zip(embeddings, metadatas):
         sanitized_meta = sanitize_metadata(meta)
-        # Extra validation: ensure all values are valid Pinecone types
-        for k, v in sanitized_meta.items():
-            if v is None:
-                sanitized_meta[k] = ""
-            elif isinstance(v, list):
-                sanitized_meta[k] = [str(x) if x is not None else "" for x in v]
-            elif not isinstance(v, (str, int, float, bool)):
-                sanitized_meta[k] = str(v)
-        logger.info(f"Upserting vector metadata: {json.dumps(sanitized_meta)}")
         vectors.append({
-            "id": uuid.uuid4().hex,
+            "id": str(uuid.uuid4()),
             "values": emb,
             "metadata": sanitized_meta
         })
