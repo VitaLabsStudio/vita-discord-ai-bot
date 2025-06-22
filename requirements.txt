@@ -1,0 +1,15 @@
+torch
+# Discord AI Bot dependencies
+discord.py
+fastapi
+uvicorn
+openai
+pinecone
+python-dotenv
+sentence-transformers
+unstructured[docx,pdf]
+spacy
+numpy<2
+apscheduler
+python-magic
+aiohttp 
